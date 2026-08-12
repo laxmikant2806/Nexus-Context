@@ -41,6 +41,7 @@ class NodeType(str, enum.Enum):
     NL_SENTENCE = "nl_sentence"    # Natural-language sentence
     TOOL_RETURN = "tool_return"    # Tool invocation return value
     SCHEMA_FIELD = "schema_field"  # JSON / Pydantic / SQL schema field
+    ADAPTIVE_CHUNK = "adaptive_chunk"  # Self-healing adaptive semantic chunk
 
 
 class EdgeType(str, enum.Enum):
@@ -53,6 +54,7 @@ class EdgeType(str, enum.Enum):
     COREF_ANTECEDENT = "coref_antecedent"   # NL coreference chain
     TOOL_RETURN_DEP = "tool_return_dep"     # Tool return → downstream argument
     SCHEMA_FIELD_DEP = "schema_field_dep"   # Schema field definition → usage
+    CHUNK_SEQUENCE = "chunk_sequence"       # Relational link between adjacent adaptive chunks
 
 
 # ---------------------------------------------------------------------------
@@ -283,3 +285,55 @@ class CompactionResult(BaseModel):
     latency_ms: float = Field(
         description="Wall-clock time for the compaction pass in milliseconds."
     )
+
+
+# ---------------------------------------------------------------------------
+# SemanticChunk & BoundaryEvaluationResult
+# ---------------------------------------------------------------------------
+
+
+class BoundaryEvaluationResult(BaseModel):
+    """Evaluation metrics for a token position during streaming chunking."""
+
+    token_index: int = Field(ge=0)
+    cosine_shift: float = Field(
+        ge=0.0,
+        description="Directional semantic shift gradient ΔS = 1 - cos(A, B).",
+    )
+    token_entropy: float = Field(
+        ge=0.0,
+        description="Conditional token entropy H(T_i | T_{i-w...i-1}).",
+    )
+    boundary_score: float = Field(
+        ge=0.0,
+        description="Score = ΔS · H(T_i).",
+    )
+    threshold: float = Field(
+        ge=0.0,
+        description="Adaptive threshold τ_boundary.",
+    )
+    is_boundary: bool = Field(
+        description="True if score > threshold and not suppressed by syntax protection.",
+    )
+    suppressed_by_syntax: bool = Field(
+        default=False,
+        description="True if score crossed threshold but split was delayed to protect unclosed code/JSON syntax.",
+    )
+
+
+class SemanticChunk(BaseModel):
+    """A self-healing adaptive semantic chunk produced by entropy boundary detection."""
+
+    chunk_id: str = Field(
+        description="Unique identifier for this chunk (e.g. 'chunk:0:0-64')."
+    )
+    turn_index: int = Field(ge=0)
+    start_token: int = Field(ge=0)
+    end_token: int = Field(ge=0)
+    content: str
+    token_count: int = Field(ge=0)
+    boundary_score: float = Field(default=0.0, ge=0.0)
+    contains_code_block: bool = Field(default=False)
+    has_unclosed_scope: bool = Field(default=False)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+

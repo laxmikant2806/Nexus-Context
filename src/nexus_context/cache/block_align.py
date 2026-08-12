@@ -223,34 +223,29 @@ class BlockAligner:
         raw_tokens = self.tokenize(system_prompt)
         l_raw = len(raw_tokens)
         l_p = math.ceil(l_raw / self._block_size) * self._block_size
-        n_pad = l_p - l_raw
+        if l_p == 0:
+            l_p = self._block_size
 
-        # Build padded content -------------------------------------------
-        if n_pad == 0:
-            padded_content = system_prompt
-        else:
-            # Append padding tokens one at a time and re-encode to verify
-            # alignment (some tokenisers merge adjacent special tokens).
-            padded_content = system_prompt + (self._pad_str * n_pad)
+        padded_content = system_prompt
+        pad_char = self._pad_str if self._pad_str else " "
 
-        # Verify alignment -----------------------------------------------
+        # Primary padding stage using selected pad string
+        while len(self.tokenize(padded_content)) < l_p:
+            padded_content += pad_char
+
         aligned_tokens = self.tokenize(padded_content)
+
+        # Secondary refinement stage (handles BPE space-merging if token count overshot/undershot)
         if len(aligned_tokens) % self._block_size != 0:
-            # Padding string may have tokenised to a different count.
-            # Fall back to single-space padding until alignment is achieved.
-            padded_content = system_prompt
-            extra = 0
-            while len(self.tokenize(padded_content)) % self._block_size != 0:
-                padded_content += _FALLBACK_PAD_STR
-                extra += 1
-                if extra > self._block_size * 2:
-                    raise AlignmentError(
-                        f"Unable to achieve block alignment for model "
-                        f"'{self._model_name}' after {extra} fallback padding "
-                        f"tokens. Check tokeniser configuration."
-                    )
-            aligned_tokens = self.tokenize(padded_content)
-            n_pad = extra
+            step_char = "#"
+            max_steps = self._block_size * 50
+            steps = 0
+            while len(aligned_tokens) % self._block_size != 0 and steps < max_steps:
+                padded_content += step_char
+                aligned_tokens = self.tokenize(padded_content)
+                steps += 1
+
+        n_pad = len(aligned_tokens) - l_raw
 
         # Compute Zone P hash --------------------------------------------
         token_bytes = b"".join(t.to_bytes(4, "little") for t in aligned_tokens)

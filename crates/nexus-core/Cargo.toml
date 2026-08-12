@@ -1,0 +1,20 @@
+[package]
+name = "nexus-core"
+version = "0.1.0"
+edition = "2021"
+authors = ["Nexus-Context Team"]
+description = "Native high-performance Rust parsing engine for self-healing adaptive semantic chunking and entropy boundary detection"
+license = "MIT"
+
+[lib]
+name = "nexus_core"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pyo3 = { version = "0.20", features = ["extension-module"], optional = true }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[features]
+default = []
+extension-module = ["pyo3"]

@@ -305,8 +305,28 @@ def _register_routes(app: FastAPI) -> None:
                 return await _json_response(
                     app.state.http_client, forward_body, pipeline_ms
                 )
-        except httpx.HTTPError as exc:
-            raise BackendProxyError(str(exc)) from exc
+        except Exception as exc:
+            backend_url = cfg["backend"]["url"]
+            logger.error(
+                '{"event":"backend_connection_error","url":"%s","error":"%s"}',
+                backend_url,
+                str(exc),
+            )
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": {
+                        "message": (
+                            f"Nexus-Context Proxy Error: Could not connect to backend SLM server "
+                            f"at '{backend_url}'. Please ensure your vLLM, SGLang, or Ollama server "
+                            f"is running and accessible."
+                        ),
+                        "type": "backend_connection_error",
+                        "param": None,
+                        "code": 503,
+                    }
+                },
+            )
 
     @app.get("/nexus/health")
     async def health() -> JSONResponse:
