@@ -88,7 +88,7 @@ warn_return_any = true
 warn_unused_configs = true
 
 [tool.pytest.ini_options]
-pythonpath = ["src"]
+pythonpath = ["src", "."]
 asyncio_mode = "auto"
 testpaths = ["tests"]
 addopts = "--cov=src/nexus_context --cov-report=term-missing --cov-fail-under=85"

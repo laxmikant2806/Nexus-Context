@@ -1,14 +1,8 @@
 /*
- * nexus-core (Native Rust Parsing Engine)
- * ========================================
- * High-speed adaptive semantic chunking via continuous directional cosine distance
- * gradients (ΔS) and conditional token entropy (H(T_i)).
- *
- * Boundary condition:
- *     ΔS · H(T_i) > τ_boundary
- *
- * Self-healing protection:
- *     Delays splitting when syntax state is inside unclosed code blocks (```) or JSON objects ({}, []).
+ * crates/nexus-core/src/chunker.rs
+ * ==================================
+ * High-speed text chunking engine with sliding window token partitioning,
+ * entropy calculations, and self-healing syntax protection.
  */
 
 use serde::{Deserialize, Serialize};
@@ -26,17 +20,36 @@ pub struct BoundaryEvaluation {
     pub suppressed_by_syntax: bool,
 }
 
-/// A self-healing adaptive chunk segment.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChunkSegment {
-    pub chunk_id: String,
-    pub start_token: usize,
-    pub end_token: usize,
-    pub content: String,
-    pub token_count: usize,
-    pub boundary_score: f64,
-    pub contains_code_block: bool,
-    pub has_unclosed_scope: bool,
+/// Fast text chunker splitting text by fixed size and overlap.
+pub fn fast_chunk_text(text: &str, chunk_size: usize, overlap: usize) -> Vec<String> {
+    if text.is_empty() || chunk_size == 0 {
+        return Vec::new();
+    }
+
+    let words: Vec<&str> = text.split_whitespace().collect();
+    if words.is_empty() {
+        return Vec::new();
+    }
+
+    let mut chunks: Vec<String> = Vec::new();
+    let step = if chunk_size > overlap {
+        chunk_size - overlap
+    } else {
+        1
+    };
+
+    let mut i = 0;
+    while i < words.len() {
+        let end = (i + chunk_size).min(words.len());
+        let chunk_words = &words[i..end];
+        chunks.push(chunk_words.join(" "));
+        if end == words.len() {
+            break;
+        }
+        i += step;
+    }
+
+    chunks
 }
 
 /// Calculates directional cosine shift ΔS = 1 - cos(A, B).
@@ -82,7 +95,6 @@ pub struct SyntaxTracker {
     pub code_fence_open: bool,
     pub curly_depth: usize,
     pub square_depth: usize,
-    pub in_string: bool,
 }
 
 impl SyntaxTracker {
@@ -162,26 +174,14 @@ impl AdaptiveChunkerEngine {
     }
 }
 
-// Optional PyO3 Python extension module bindings
-#[cfg(feature = "extension-module")]
-use pyo3::prelude::*;
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-#[cfg(feature = "extension-module")]
-#[pyfunction]
-fn rust_compute_cosine_shift(vec_a: Vec<f64>, vec_b: Vec<f64>) -> PyResult<f64> {
-    Ok(compute_cosine_shift(&vec_a, &vec_b))
-}
-
-#[cfg(feature = "extension-module")]
-#[pyfunction]
-fn rust_compute_conditional_entropy(tokens: Vec<String>) -> PyResult<f64> {
-    Ok(compute_conditional_entropy(&tokens))
-}
-
-#[cfg(feature = "extension-module")]
-#[pymodule]
-fn nexus_core(_py: Python, m: &PyModule) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(rust_compute_cosine_shift, m)?)?;
-    m.add_function(wrap_pyfunction!(rust_compute_conditional_entropy, m)?)?;
-    Ok(())
+    #[test]
+    fn test_fast_chunk_text() {
+        let text = "one two three four five six seven eight nine ten";
+        let chunks = fast_chunk_text(text, 4, 1);
+        assert!(!chunks.is_empty());
+    }
 }
