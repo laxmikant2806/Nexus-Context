@@ -28,10 +28,20 @@ from nexus_context import BackendProxyError, ConfigurationError
 from nexus_context.cache.block_align import BlockAligner
 from nexus_context.cache.differential import ZoneSegmenter
 from nexus_context.cache.schemas import ChatMessage
+from nexus_context.cache.tool_compressor import ToolCallCompressor  # Feature D
 from nexus_context.guard.ast_graph import ContextGraphBuilder
 from nexus_context.guard.submodular import SubmodularSolver
 from nexus_context.memory.decay import MemoryPool
+from nexus_context.memory.ltkb import LongTermKnowledgeBase  # Feature I
 from nexus_context.memory.www_parser import WWWParser
+from nexus_context.persistence.session_store import SessionStore  # Feature B
+from nexus_context.telemetry import (  # Feature C
+    TelemetryBus,
+    emit_session_created,
+    emit_session_restored,
+    emit_tool_call_intercepted,
+    emit_turn_processed,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +74,15 @@ _DEFAULT_CONFIG: dict[str, Any] = {
         "model_name": "default",  # set from /v1/models probe at startup
         "total_budget": 4096,
     },
+    "persistence": {  # Feature B
+        "enabled": False,
+        "db_path": "nexus_sessions.db",
+        "persist_every": 5,
+    },
+    "ltkb": {  # Feature I
+        "enabled": True,
+        "db_path": "nexus_ltkb.db",
+    },
 }
 
 
@@ -83,6 +102,7 @@ class _SessionState:
         "aligned_zone_p",
         "zone_p_hash",
         "turn_counter",
+        "graph",          # Feature A: most recent ContextGraph for LTKB extraction
     )
 
     def __init__(self, session_id: str) -> None:
@@ -93,6 +113,7 @@ class _SessionState:
         self.aligned_zone_p: str | None = None
         self.zone_p_hash: str | None = None
         self.turn_counter: int = 0
+        self.graph: Any = None  # Feature A
 
 
 # ---------------------------------------------------------------------------
@@ -104,6 +125,9 @@ class _SessionState:
 async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Initialise shared subsystems on startup; clean up on shutdown."""
     cfg = app.state.config  # type: ignore[attr-defined]
+
+    # Feature C: Telemetry bus (must be first — others depend on it)
+    app.state.telemetry = TelemetryBus(max_history=500)
 
     app.state.graph_builder = ContextGraphBuilder(session_id="shared")
     app.state.solver = SubmodularSolver(
@@ -118,12 +142,54 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         timeout=httpx.Timeout(300.0),
     )
 
+    # Feature D: Shared tool call compressor
+    app.state.tool_compressor = ToolCallCompressor(budget_tokens=512)
+
+    # Feature B: Session persistence store
+    persist_cfg = cfg.get("persistence", {})
+    if persist_cfg.get("enabled", False):
+        store = SessionStore(db_path=persist_cfg.get("db_path", "nexus_sessions.db"))
+        await store.initialize()
+        app.state.session_store: SessionStore | None = store
+        # Restore all persisted sessions on startup
+        for sid in await store.list_sessions():
+            data = await store.load_session(sid)
+            if data:
+                restored = _SessionState(sid)
+                restored.turn_counter = data["turn_counter"]
+                restored.zone_p_hash = data["zone_p_hash"]
+                restored.aligned_zone_p = data["aligned_zone_p"]
+                app.state.sessions[sid] = restored
+                emit_session_restored(app.state.telemetry, sid, data["turn_counter"])
+                logger.info('{"event":"session_restored","session_id":"%s"}', sid)
+    else:
+        app.state.session_store = None
+
+    # Feature I: Long-Term Knowledge Base
+    ltkb_cfg = cfg.get("ltkb", {})
+    if ltkb_cfg.get("enabled", True):
+        ltkb = LongTermKnowledgeBase(db_path=ltkb_cfg.get("db_path", "nexus_ltkb.db"))
+        await ltkb.initialize()
+        app.state.ltkb: LongTermKnowledgeBase | None = ltkb
+    else:
+        app.state.ltkb = None
+
     logger.info(
         '{"event":"middleware_startup","backend":"%s","type":"%s"}',
         cfg["backend"]["url"],
         cfg["backend"]["type"],
     )
     yield
+
+    # Shutdown: persist LTKB facts for all active sessions
+    ltkb_inst: LongTermKnowledgeBase | None = getattr(app.state, "ltkb", None)
+    if ltkb_inst is not None:
+        for sid, sess in app.state.sessions.items():
+            if sess.graph is not None:
+                await ltkb_inst.extract_and_persist(
+                    sess.graph, sid, sess.turn_counter,
+                    telemetry_bus=app.state.telemetry,
+                )
 
     await app.state.http_client.aclose()
     logger.info('{"event":"middleware_shutdown"}')
@@ -152,12 +218,17 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
 
 def _register_routes(app: FastAPI) -> None:
 
+    # Feature C: Mount the real-time dashboard router
+    from nexus_context.dashboard.router import router as dashboard_router
+    app.include_router(dashboard_router)
+
     @app.post("/v1/chat/completions")
     async def chat_completions(request: Request) -> Response:
         body: dict[str, Any] = await request.json()
         session_id = request.headers.get("X-Session-ID") or _derive_session_id(request)
         cfg: dict[str, Any] = app.state.config
         t_start = time.perf_counter()
+        telemetry: TelemetryBus = app.state.telemetry
 
         # --------------------------------------------------------
         # Session initialisation (first call only)
@@ -166,11 +237,44 @@ def _register_routes(app: FastAPI) -> None:
         if session is None:
             session = _SessionState(session_id)
             app.state.sessions[session_id] = session
+            emit_session_created(telemetry, session_id)
+
+            # Feature I: Inject LTKB facts into Zone P for new sessions
+            ltkb_inst: LongTermKnowledgeBase | None = getattr(app.state, "ltkb", None)
+            if ltkb_inst is not None:
+                raw_msgs = body.get("messages", [])
+                query_hint = next(
+                    (m.get("content", "") for m in raw_msgs if m.get("role") == "user"), ""
+                )
+                ltkb_facts = await ltkb_inst.get_relevant_facts(query_hint, top_k=5)
+                if ltkb_facts:
+                    annotation = await ltkb_inst.inject_into_zone_p(ltkb_facts)
+                    # Append LTKB annotation to system message if present
+                    for i, m in enumerate(body.get("messages", [])):
+                        if m.get("role") == "system":
+                            body["messages"][i]["content"] += f"\n{annotation}"
+                            break
 
         # --------------------------------------------------------
         # Parse messages
         # --------------------------------------------------------
         raw_messages: list[dict[str, str]] = body.get("messages", [])
+
+        # Feature D: Tool call interception — compress oversized tool returns
+        compressor: ToolCallCompressor = app.state.tool_compressor
+        for i, msg_dict in enumerate(raw_messages):
+            if msg_dict.get("role") == "tool":
+                content = msg_dict.get("content", "")
+                original_tokens = compressor.estimate_tokens(content)
+                if original_tokens > 512:
+                    compressed, orig_tok = compressor.compress(content)
+                    raw_messages[i] = {**msg_dict, "content": compressed}
+                    emit_tool_call_intercepted(
+                        telemetry, session_id,
+                        original_tokens=orig_tok,
+                        compressed_tokens=compressor.estimate_tokens(compressed),
+                    )
+
         messages = _parse_messages(raw_messages, session.turn_counter)
 
         # --------------------------------------------------------
@@ -229,6 +333,7 @@ def _register_routes(app: FastAPI) -> None:
             if bundle.compaction_required and bundle.zone_t_candidates:
                 graph = app.state.graph_builder.build(bundle.zone_t_candidates)
                 graph.compute_transitive_closure()
+                session.graph = graph  # Feature A: store for LTKB extraction
                 query = (
                     bundle.zone_r_messages[-1].content
                     if bundle.zone_r_messages
@@ -289,6 +394,46 @@ def _register_routes(app: FastAPI) -> None:
             transformed_messages = raw_messages
 
         session.turn_counter += 1
+
+        # Feature C: Emit turn_processed telemetry for dashboard
+        pipeline_ms_pre = (time.perf_counter() - t_start) * 1000
+        _graph = getattr(session, "graph", None)
+        emit_turn_processed(
+            telemetry,
+            session_id=session_id,
+            pipeline_ms=pipeline_ms_pre,
+            tokens_in=sum(len(m.get("content", "")) // 4 for m in transformed_messages),
+            tokens_out=0,
+            zone_p_hit=session.zone_p_hash is not None,
+            compaction_applied=compaction is not None,
+            memory_tuples_count=len(session.memory_pool) if session.memory_pool else 0,
+            graph_node_count=len(_graph.nodes) if _graph and hasattr(_graph, "nodes") else 0,
+            graph_edge_count=len(_graph.edges) if _graph and hasattr(_graph, "edges") else 0,
+            turn_counter=session.turn_counter,
+        )
+
+        # Feature B: Persist session every N turns
+        persist_cfg = cfg.get("persistence", {})
+        store: SessionStore | None = getattr(app.state, "session_store", None)
+        if store is not None and persist_cfg.get("enabled", False):
+            every = persist_cfg.get("persist_every", 5)
+            if session.turn_counter % every == 0:
+                memory_tuples_json: list[str] = []
+                if session.memory_pool is not None:
+                    try:
+                        memory_tuples_json = [
+                            t.model_dump_json()
+                            for t in list(session.memory_pool._pool.values())[:200]
+                        ]
+                    except Exception:
+                        pass
+                await store.save_session(
+                    session_id=session_id,
+                    turn_counter=session.turn_counter,
+                    zone_p_hash=session.zone_p_hash,
+                    aligned_zone_p=session.aligned_zone_p,
+                    memory_tuples_json=memory_tuples_json,
+                )
 
         # --------------------------------------------------------
         # Forward to backend
@@ -354,7 +499,19 @@ def _register_routes(app: FastAPI) -> None:
 
     @app.delete("/nexus/session/{session_id}")
     async def clear_session(session_id: str) -> JSONResponse:
-        if session_id in app.state.sessions:
+        session = app.state.sessions.get(session_id)
+        if session is not None:
+            # Feature I: Persist LTKB facts before clearing
+            ltkb_inst: LongTermKnowledgeBase | None = getattr(app.state, "ltkb", None)
+            if ltkb_inst is not None and session.graph is not None:
+                await ltkb_inst.extract_and_persist(
+                    session.graph, session_id, session.turn_counter,
+                    telemetry_bus=getattr(app.state, "telemetry", None),
+                )
+            # Feature B: Remove from persistent store
+            store: SessionStore | None = getattr(app.state, "session_store", None)
+            if store is not None:
+                await store.delete_session(session_id)
             del app.state.sessions[session_id]
         return JSONResponse({"status": "cleared", "session_id": session_id})
 
@@ -455,13 +612,26 @@ def main() -> None:
     parser.add_argument("--block-size", type=int, choices=[16, 32], default=16)
     parser.add_argument("--total-budget", type=int, default=4096)
     parser.add_argument("--log-level", default="info")
+    # Feature B: Session persistence flags
+    parser.add_argument("--persist", action="store_true", help="Enable SQLite session persistence")
+    parser.add_argument("--db-path", default="nexus_sessions.db", help="Path to sessions SQLite DB")
+    parser.add_argument("--persist-every", type=int, default=5, help="Save session every N turns")
+    # Feature I: LTKB flags
+    parser.add_argument("--ltkb-db", default="nexus_ltkb.db", help="Path to LTKB SQLite DB")
+    parser.add_argument("--no-ltkb", action="store_true", help="Disable long-term knowledge base")
     args = parser.parse_args()
 
-    cfg = _DEFAULT_CONFIG.copy()
+    import copy
+    cfg = copy.deepcopy(_DEFAULT_CONFIG)
     cfg["backend"]["url"] = args.backend_url
     cfg["backend"]["type"] = args.backend_type
     cfg["cache"]["block_size"] = args.block_size
     cfg["server"]["total_budget"] = args.total_budget
+    cfg["persistence"]["enabled"] = args.persist
+    cfg["persistence"]["db_path"] = args.db_path
+    cfg["persistence"]["persist_every"] = args.persist_every
+    cfg["ltkb"]["enabled"] = not args.no_ltkb
+    cfg["ltkb"]["db_path"] = args.ltkb_db
 
     logging.basicConfig(level=args.log_level.upper())
 

@@ -42,6 +42,8 @@ class NodeType(str, enum.Enum):
     TOOL_RETURN = "tool_return"    # Tool invocation return value
     SCHEMA_FIELD = "schema_field"  # JSON / Pydantic / SQL schema field
     ADAPTIVE_CHUNK = "adaptive_chunk"  # Self-healing adaptive semantic chunk
+    TOOL_JSON_FIELD = "tool_json_field"  # Feature A: key-value field from tool-call JSON response
+    API_RESPONSE = "api_response"        # Feature A: full captured API/tool response node
 
 
 class EdgeType(str, enum.Enum):
@@ -55,6 +57,8 @@ class EdgeType(str, enum.Enum):
     TOOL_RETURN_DEP = "tool_return_dep"     # Tool return → downstream argument
     SCHEMA_FIELD_DEP = "schema_field_dep"   # Schema field definition → usage
     CHUNK_SEQUENCE = "chunk_sequence"       # Relational link between adjacent adaptive chunks
+    TOOL_FIELD_TO_CODE_REF = "tool_field_to_code_ref"  # Feature A: JSON response field → code symbol
+    SCHEMA_TO_TOOL_RETURN = "schema_to_tool_return"    # Feature A: DB/JSON schema → matching tool return
 
 
 # ---------------------------------------------------------------------------

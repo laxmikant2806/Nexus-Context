@@ -717,3 +717,102 @@ class ContextGraphBuilder:
                 '"note":"install spacy and en_core_web_trf for NL analysis"}'
             )
             return None
+
+    # ------------------------------------------------------------------
+    # Feature A: Multi-Modal cross-modal tool-call graph extraction
+    # ------------------------------------------------------------------
+
+    def extract_tool_return_nodes(
+        self,
+        msg: ChatMessage,
+        existing_nodes: list[ContextNode],
+    ) -> tuple[list[ContextNode], list[DependencyEdge]]:
+        """Feature A: Parse ``role == "tool"`` message JSON content into graph nodes.
+
+        For each top-level key-value pair in the JSON response, creates a
+        ``TOOL_JSON_FIELD`` node. Cross-references field names against existing
+        ``AST_ASSIGNMENT`` nodes by exact name match and creates
+        ``TOOL_FIELD_TO_CODE_REF`` directed edges on matches.
+
+        Parameters
+        ----------
+        msg:
+            The tool-role ``ChatMessage`` to parse.
+        existing_nodes:
+            Already-built nodes from the session graph for cross-referencing.
+
+        Returns
+        -------
+        tuple[list[ContextNode], list[DependencyEdge]]
+            New nodes and edges to merge into the ContextGraph.
+        """
+        import json as _json
+
+        new_nodes: list[ContextNode] = []
+        new_edges: list[DependencyEdge] = []
+
+        if msg.role != "tool":
+            return new_nodes, new_edges
+
+        # Parse JSON content
+        try:
+            data = _json.loads(msg.content.strip())
+        except (_json.JSONDecodeError, ValueError):
+            # Non-JSON tool return: create a single API_RESPONSE node
+            node_id = f"{msg.turn_index}:{NodeType.API_RESPONSE.value}:{_short_id(msg.content)}"
+            new_nodes.append(
+                ContextNode(
+                    node_id=node_id,
+                    node_type=NodeType.API_RESPONSE,
+                    turn_index=msg.turn_index,
+                    content=msg.content[:500],
+                    token_count=msg.token_count,
+                    metadata={"source": "tool_return"},
+                )
+            )
+            return new_nodes, new_edges
+
+        if not isinstance(data, dict):
+            return new_nodes, new_edges
+
+        # Build name → node_id index for existing AST_ASSIGNMENT nodes
+        assignment_index: dict[str, str] = {}
+        for node in existing_nodes:
+            if node.node_type == NodeType.AST_ASSIGNMENT:
+                name = node.metadata.get("name", "") if node.metadata else ""
+                if name:
+                    assignment_index[name.lower()] = node.node_id
+
+        # Create TOOL_JSON_FIELD node per top-level key
+        for key, value in list(data.items())[:30]:
+            value_repr = str(value)[:200]
+            node_id = f"{msg.turn_index}:{NodeType.TOOL_JSON_FIELD.value}:{key}"
+            field_node = ContextNode(
+                node_id=node_id,
+                node_type=NodeType.TOOL_JSON_FIELD,
+                turn_index=msg.turn_index,
+                content=f"{key}={value_repr}",
+                token_count=max(1, len(value_repr) // 4),
+                metadata={"key": key, "source": "tool_json"},
+            )
+            new_nodes.append(field_node)
+
+            # Cross-reference: does a code variable with this name exist?
+            code_node_id = assignment_index.get(key.lower())
+            if code_node_id:
+                edge_id = f"{node_id}->{code_node_id}"
+                new_edges.append(
+                    DependencyEdge(
+                        edge_id=edge_id,
+                        source_id=node_id,
+                        target_id=code_node_id,
+                        edge_type=EdgeType.TOOL_FIELD_TO_CODE_REF,
+                        weight=0.9,
+                    )
+                )
+                logger.debug(
+                    '{"event":"cross_modal_edge","key":"%s","target":"%s"}',
+                    key, code_node_id,
+                )
+
+        return new_nodes, new_edges
