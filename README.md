@@ -1,225 +1,198 @@
-# Nexus-Context
+# nexus-context
 
-> **Lightweight Python framework for referential integrity, KV cache alignment, and WWW memory
-> governance in local Small Language Model (SLM) deployments.**
+> **Transparent middleware for referential integrity, KV-cache alignment,
+> and WWW memory governance in local SLM deployments.**
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![PyPI version](https://img.shields.io/pypi/v/nexus-context.svg)](https://pypi.org/project/nexus-context/)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![CI](https://github.com/laxmikant2806/Nexus-Context/actions/workflows/ci.yml/badge.svg)](https://github.com/laxmikant2806/Nexus-Context/actions)
 [![Status: Alpha](https://img.shields.io/badge/status-alpha-orange.svg)]()
+
+---
+
+## Install
+
+```bash
+# Core install (~50 MB — no ML models)
+pip install nexus-context
+
+# With semantic embedding support (adds ~2 GB torch + sentence-transformers)
+pip install "nexus-context[embeddings]"
+
+# Full install — all optional extras
+pip install "nexus-context[full]"
+```
 
 ---
 
 ## The Problem
 
-When running autonomous coding agents on local SLMs (vLLM, SGLang, Ollama), three compounding
+When running autonomous agents on local SLMs (vLLM, SGLang, Ollama), three compounding
 failure modes emerge as context grows:
 
-1. **Referential Dangling**: Standard prompt compression tools (LLMLingua, Selective Context)
-   prune variable definitions and tool schemas while retaining code that depends on them. The
-   result: `NameError: name 'DB_HOST' is not defined` — over 88% of all compression-induced
-   errors in agentic sessions are of this class.
+1. **Referential Dangling** — Standard prompt compression tools prune variable definitions
+   while retaining code that depends on them. Result: `NameError: name 'DB_HOST' is not defined`.
+   Over 88% of compression-induced errors in agentic sessions are of this class.
 
-2. **KV Cache Invalidation Tax**: Any modification to the middle of a PagedAttention context
-   invalidates the prefix hash for all subsequent tokens, forcing full recomputation. On a 7B
-   model, this adds ~1.1 seconds of TTFT penalty per turn — accumulating to minutes of
-   wasted GPU time per session.
+2. **KV Cache Invalidation Tax** — Any modification to the middle of a PagedAttention context
+   invalidates the prefix hash, forcing full KV recomputation. On a 7B model this adds ~1.1s
+   TTFT penalty per turn — accumulating to minutes of wasted GPU time per long session.
 
-3. **Episodic Memory Bloat**: Agents accumulate verbose tool outputs and conversational history
-   that contain only a fraction of actionable state. A 127-token "CREATE TABLE..." execution
-   record can be losslessly compressed to a 31-token semantic mutation tuple.
+3. **Episodic Memory Bloat** — Verbose tool outputs accumulate in context.
+   A 127-token `CREATE TABLE...` record can be losslessly compressed to a 31-token semantic tuple.
 
-## The Solution
+---
 
-Nexus-Context is a **transparent middleware layer** that sits between your agent and its local
-SLM backend. It transforms context payloads through three cooperating subsystems:
+## Solution
+
+Nexus-Context sits transparently between your agent and its local SLM:
 
 ```
-Agent ──► Nexus-Context Middleware ──► vLLM / SGLang / Ollama
-               │
-               ├── nexus.guard:  AST dependency graph + submodular pruning
-               ├── nexus.cache:  Block-aligned prefix zone locking
-               └── nexus.memory: WWW episodic-to-semantic decay
+Agent ──► nexus-serve (localhost:9000) ──► vLLM / SGLang / Ollama
+                │
+                ├── nexus.guard:   AST dependency graph + submodular pruning
+                ├── nexus.cache:   Block-aligned prefix zone locking
+                └── nexus.memory:  WWW episodic-to-semantic decay
 ```
+
+---
+
+## Quick-Start (60 seconds)
+
+**Terminal 1** — Start your local model:
+```bash
+ollama run qwen2.5-coder:7b
+```
+
+**Terminal 2** — Start Nexus-Context proxy:
+```bash
+nexus-serve --backend-url http://localhost:11434 --backend-type ollama --port 9000
+```
+
+**Terminal 3** — Point your existing OpenAI client at port 9000 instead of 11434:
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:9000/v1",   # <- only this line changes
+    api_key="local",
+)
+
+# Turn 1: define a variable
+r1 = client.chat.completions.create(
+    model="qwen2.5-coder:7b",
+    messages=[
+        {"role": "system", "content": "You are a Python coding agent."},
+        {"role": "user", "content": "Define DB_HOST = 'prod.db.internal' and write connect_db()."},
+    ],
+    extra_headers={"X-Session-ID": "my-session"},
+)
+
+# Turn 2: reference it — DB_HOST is GUARANTEED to survive compaction
+r2 = client.chat.completions.create(
+    model="qwen2.5-coder:7b",
+    messages=[
+        {"role": "system", "content": "You are a Python coding agent."},
+        {"role": "user", "content": "Now write query_orders() using connect_db()."},
+    ],
+    extra_headers={"X-Session-ID": "my-session"},
+)
+```
+
+**Dashboard** — Open http://localhost:9000/dashboard for live metrics.
+
+---
+
+## Embedding in Your FastAPI App
+
+```python
+import uvicorn
+from nexus_context import create_app
+
+app = create_app(
+    backend_url="http://localhost:11434",
+    backend_type="ollama",
+    total_budget=8192,
+    persist=True,             # SQLite session crash-recovery
+)
+
+uvicorn.run(app, host="0.0.0.0", port=9000)
+```
+
+---
 
 ## Key Guarantees
 
 | Guarantee | Target | Mechanism |
 |---|---|---|
-| **Zero referential dangling** | 0% NameError rate | γ→∞ submodular penalty on orphaned nodes |
-| **Prefix KV cache preservation** | >85% hit rate | Block-aligned Zone P locked for session lifetime |
-| **Memory compression** | >4:1 ratio | WWW semantic mutation tuple extraction |
-| **Low overhead** | <80ms P95 per request | Lazy greedy + embedding cache + async pipeline |
-| **Backend agnostic** | vLLM, SGLang, Ollama | OpenAI `/v1/chat/completions` proxy |
+| Zero referential dangling | 0% NameError rate | γ→∞ submodular penalty on orphaned nodes |
+| Prefix KV cache preservation | >85% hit rate | Block-aligned Zone P locked for session lifetime |
+| Memory compression | >4:1 ratio | WWW semantic mutation tuple extraction |
+| Low overhead | <80ms P95 per request | Lazy greedy + async pipeline |
+| Backend agnostic | vLLM, SGLang, Ollama | OpenAI `/v1/chat/completions` proxy |
 
-## Architecture Overview
+---
 
-```
-Raw Payload
-    │
-    ▼
-FastAPI Middleware (nexus.cache.middleware)
-    │
-    ├─[Stage 1]─► Block Alignment (nexus.cache.block_align)
-    │               Pad system prompt to B_block boundary. Freeze Zone P forever.
-    │
-    ├─[Stage 2]─► Zone Segmentation (nexus.cache.differential)
-    │               Partition: [Zone P | Zone T | Zone R]
-    │
-    ├─[Stage 3]─► AST Dependency Graph (nexus.guard.ast_graph)
-    │               Tree-Sitter (Python/SQL/Bash) + spaCy coreference
-    │
-    ├─[Stage 4]─► Submodular Pruning (nexus.guard.submodular)
-    │               max f(S) = α·Relevance + β·Coverage − γ·DanglingPenalty
-    │
-    ├─[Stage 5]─► WWW Memory Injection (nexus.memory)
-    │               Pruned turns → ⟨Who, What, When, Where⟩ tuples
-    │               W(t,s) = exp(−λ(T−t))·(1 + η·AST_Depth(s))
-    │
-    └────────────► Transformed Payload ──► vLLM Server
-                    (prefix cache hit guaranteed on Zone P)
-```
+## Optional Extras
 
-## Quick Start
-
-```bash
-# Install
-pip install nexus-context
-
-# Download spaCy model
-python -m spacy download en_core_web_trf
-python -m coreferee install en
-
-# Start middleware (proxying to local vLLM on port 8000)
-nexus-serve --backend-url http://localhost:8000 --backend-type vllm --port 9000
-
-# Point your agent at port 9000 instead of 8000
-# Zero code changes required in your agent
-```
-
-## Configuration
-
-Create `nexus_config.yaml`:
-
-```yaml
-backend:
-  url: "http://localhost:8000"   # vLLM / SGLang / Ollama URL
-  type: "vllm"                   # vllm | sglang | ollama
-
-cache:
-  block_size: 16                 # PagedAttention block size (must match backend)
-  tail_budget_tokens: 1024       # Zone R verbatim tail size
-  tail_retention_turns: 3        # Turns to keep in Zone R before graduation
-
-guard:
-  alpha: 0.5                     # Relevance weight in submodular objective
-  beta: 0.5                      # Coverage weight in submodular objective
-  embedding_model: "all-MiniLM-L6-v2"
-
-memory:
-  lambda: 0.05                   # Temporal decay constant (half-life ~13.9 turns)
-  eta: 0.5                       # AST depth amplification factor
-  budget_fraction: 0.15          # Memory block uses 15% of total token budget
-  persist: false                 # Cross-session memory persistence
-```
-
-## Mathematical Foundations
-
-### Referential Integrity (nexus.guard)
-
-Context compression is formulated as submodular maximization:
-
-```
-max_{S ⊆ V, tokens(S) ≤ B}  f(S) = α·Relevance(S) + β·Coverage(S) − γ·DanglingPenalty(S)
-
-DanglingPenalty(S) = Σ_{(u,v) ∈ E*} I(v ∈ S ∧ u ∉ S)
-
-γ → ∞  (hard constraint: no orphaned nodes permitted)
-```
-
-### Block Alignment (nexus.cache)
-
-```
-L_P = ⌈L_raw / B_block⌉ × B_block    (Zone P padded to block boundary)
-h_i = SHA256(T[i·B_block : (i+1)·B_block] ∥ h_{i-1})    (prefix hash chain)
-```
-
-### Memory Decay (nexus.memory)
-
-```
-W(t_i, s_i) = exp(−λ(T − t_i)) · (1 + η · AST_Depth(s_i))
-
-AST_Depth(s_i) = (D_max − d(s_i)) / D_max    (root scope = 1.0, deep nesting → 0)
-```
-
-## Development Phases
-
-| Phase | Subsystem | Status |
+| Extra | Installs | Enables |
 |---|---|---|
-| 1 | Block Alignment & Zone Segmentation | 🔲 Not started |
-| 2 | AST Dependency Graph & Submodular Solver | 🔲 Not started |
-| 3 | WWW Memory Extraction & Decay | 🔲 Not started |
-| 4 | FastAPI Middleware & Backend Proxy | 🔲 Not started |
-| 5 | Verification & Benchmark Suite | 🔲 Not started |
+| `[nlp]` | spaCy, coreferee | NL coreference edges in context graph |
+| `[embeddings]` | sentence-transformers, torch | Semantic similarity scoring in submodular solver |
+| `[parsers]` | tree-sitter-* | Multi-language AST parsing (Python/SQL/Bash/JS) |
+| `[hnswlib]` | hnswlib | ANN vector index for faster similarity lookup |
+| `[full]` | All of the above | Complete feature set |
+| `[dev]` | pytest, ruff, mypy, build, twine | Development tooling |
 
-See [`docs/planner.md`](docs/planner.md) for detailed milestone breakdown.
+---
 
-## Documentation
-
-| Document | Description |
-|---|---|
-| [`docs/overview_and_research.md`](docs/overview_and_research.md) | Theoretical foundations, empirical evidence, and prior art |
-| [`docs/architecture.md`](docs/architecture.md) | System design, Pydantic schemas, dataflow diagram |
-| [`docs/planner.md`](docs/planner.md) | Phase-by-phase milestones, risk register, complexity metrics |
-| [`docs/decisions.md`](docs/decisions.md) | Architecture Decision Records (ADR-001 through ADR-006) |
-| [`docs/implementation_stage.md`](docs/implementation_stage.md) | Step-by-step implementation guide with checklists |
-
-## Repository Structure
+## CLI Reference
 
 ```
-nexus-context/
-├── docs/
-│   ├── overview_and_research.md   # Theory, empirical data, prior art
-│   ├── architecture.md            # System design & Pydantic schemas
-│   ├── planner.md                 # Development milestones & risk register
-│   ├── decisions.md               # Architecture Decision Records
-│   └── implementation_stage.md   # Step-by-step implementation guide
-├── src/
-│   └── nexus_context/
-│       ├── __init__.py
-│       ├── guard/
-│       │   ├── __init__.py
-│       │   ├── ast_graph.py       # Tree-Sitter & spaCy dependency graph builder
-│       │   ├── submodular.py      # Budget-constrained greedy submodular solver
-│       │   └── schemas.py         # ContextNode, DependencyEdge, ContextGraph, CompactionResult
-│       ├── cache/
-│       │   ├── __init__.py
-│       │   ├── block_align.py     # PagedAttention block padding logic
-│       │   ├── differential.py    # Zone P/T/R segmentation engine
-│       │   ├── middleware.py      # FastAPI transparent proxy
-│       │   └── schemas.py         # ChatMessage, ZoneBundle, CacheBoundary
-│       └── memory/
-│           ├── __init__.py
-│           ├── www_parser.py      # Who-What-When/Where tuple extractor
-│           ├── decay.py           # Exponential decay and memory pool management
-│           └── schemas.py         # MemoryTuple, WhatDelta, WhoActor
-├── tests/
-│   ├── test_guard.py
-│   ├── test_cache.py
-│   └── test_memory.py
-├── pyproject.toml
-└── README.md
+nexus-serve [OPTIONS]
+
+Options:
+  --backend-url URL       Backend SLM server URL (default: http://localhost:8000)
+  --backend-type TYPE     vllm | sglang | ollama (default: vllm)
+  --port INT              Port to listen on (default: 9000)
+  --host STR              Bind host (default: 0.0.0.0)
+  --block-size INT        KV block size: 16 or 32 (default: 16)
+  --total-budget INT      Max context token budget (default: 4096)
+  --persist               Enable SQLite session persistence
+  --db-path PATH          Session DB path (default: nexus_sessions.db)
+  --persist-every INT     Save session every N turns (default: 5)
+  --ltkb-db PATH          LTKB DB path (default: nexus_ltkb.db)
+  --no-ltkb               Disable long-term knowledge base
+  --log-level LEVEL       Logging level (default: info)
 ```
+
+---
+
+## Architecture
+
+```
+POST /v1/chat/completions
+         │
+         ▼
+┌─────────────────────────────────┐
+│ 1. Tool Call Interception       │  JSON/text compression for role=tool messages
+├─────────────────────────────────┤
+│ 2. Block-Aligned Zone P Lock    │  SHA-256 prefix hash frozen for session lifetime
+├─────────────────────────────────┤
+│ 3. AST Dependency Graph         │  Multi-modal graph: code + NL + tool output nodes
+├─────────────────────────────────┤
+│ 4. Submodular Compaction Solver │  Budget-safe pruning with ∞ dangling penalty
+├─────────────────────────────────┤
+│ 5. WWW Memory + LTKB Injection  │  Persistent facts injected across sessions
+└─────────────────────────────────┘
+         │
+         ▼
+Backend SLM (vLLM / SGLang / Ollama)
+```
+
+---
 
 ## License
 
-MIT License. See [LICENSE](LICENSE) for details.
-
-## Research References
-
-- Kwon et al. (2023). Efficient Memory Management for LLM Serving with PagedAttention. SOSP 2023.
-- Jiang et al. (2023). LLMLingua: Compressing Prompts for Accelerated Inference. EMNLP 2023.
-- Nemhauser, Wolsey, Fisher (1978). An analysis of approximations for maximizing submodular set
-  functions. Mathematical Programming.
-- Zheng et al. (2023). SGLang: Efficient Execution of Structured LM Programs. arXiv:2312.07104.
-
-See [`docs/overview_and_research.md`](docs/overview_and_research.md) for the complete bibliography.
+MIT © 2026 Laxmikant Bhagat

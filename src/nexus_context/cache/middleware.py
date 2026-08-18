@@ -203,12 +203,16 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
             "Transparent proxy that applies referential integrity, KV cache "
             "alignment, and WWW memory governance to SLM context payloads."
         ),
-        version="0.1.0",
+        version="0.2.0",
         lifespan=_lifespan,
     )
     app.state.config = config or _DEFAULT_CONFIG
     _register_routes(app)
     return app
+
+
+# Public alias used by the top-level nexus_context.create_app factory
+_build_app = create_app
 
 
 # ---------------------------------------------------------------------------
