@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "nexus-context"
-version = "0.2.0"
+version = "0.2.1"
 description = "Transparent middleware for referential integrity, KV-cache alignment, and WWW memory governance in local SLM deployments"
 readme = "README.md"
 license = { text = "MIT" }

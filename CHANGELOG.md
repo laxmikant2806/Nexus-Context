@@ -6,6 +6,19 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ---
 
+## [0.2.1] — 2026-08-18
+
+### Changed
+- `README.md`: Comprehensive rewrite for PyPI — covers problem statement with analogies,
+  full quick-start, all 7 features explained, CLI reference, API reference, benchmark table,
+  architecture deep-dive, backend compatibility table, contributing guide, and changelog link.
+
+---
+
+
+
+---
+
 ## [0.2.0] — 2026-08-18
 
 ### Added

@@ -25,7 +25,7 @@ nexus_context.telemetry   – Async event bus for live metrics
 
 from __future__ import annotations
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 __author__ = "Laxmikant Bhagat"
 __email__ = "laxmikant2806@gmail.com"
 __license__ = "MIT"
